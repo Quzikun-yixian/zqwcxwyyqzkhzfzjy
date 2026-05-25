@@ -1,5 +1,34 @@
 # MuJoCo 机械臂-夹爪仿真平台
 
+## 0. 给算法组的使用入口
+
+算法组请先看：
+
+```text
+docs/algorithm_team_usage.md
+```
+
+最重要的结论：
+
+```text
+1. 不要直接改 MuJoCo XML，不要直接操作 data.qpos / data.ctrl。
+2. 普通运动规划使用 ArmPlatformAPI。
+3. 稳定接触力反馈使用 joint4 导纳力控 demo。
+4. 高级力矩级控制使用 Stage 3 v2 torque force-control demo。
+5. 轴孔对接算法应写在 src/task/peg_in_hole/ 或 experiments/ 下。
+```
+
+常用命令：
+
+```bash
+python scripts/run_algorithm_api_demo.py
+python scripts/run_joint4_admittance_force_control_demo.py --target-force 5
+python scripts/run_torque_force_control_demo.py --target-force 5
+```
+
+---
+
+
 ## 1. 项目定位
 
 本项目是一个面向多人协作开发的 MuJoCo 机械臂仿真平台。当前版本包含：
