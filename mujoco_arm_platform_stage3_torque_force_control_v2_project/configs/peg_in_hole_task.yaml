@@ -1,0 +1,29 @@
+peg_in_hole:
+  reference_paper: Compliance-Based Robotic Peg-in-Hole Assembly Strategy Without Force Feedback
+
+  state_sequence:
+    - idle
+    - approach_hole
+    - grasp_peg
+    - move_to_pre_insert
+    - reaching_push
+    - searching_spiral
+    - inserting_wiggle_screw
+    - complete
+
+  search:
+    planner: archimedes_spiral
+    radius_max: 0.03
+    pitch: 0.003
+    speed: 0.01
+
+  insertion:
+    push_depth: 0.03
+    wiggle_amplitude_rad: 0.05
+    screw_amplitude_rad: 0.2
+    duration: 5.0
+
+  contact_detection:
+    use_kinematic_velocity: true
+    velocity_threshold: 0.02
+    hold_time: 0.3
