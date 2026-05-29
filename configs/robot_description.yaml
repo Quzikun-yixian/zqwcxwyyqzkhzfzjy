@@ -42,6 +42,7 @@ sites:
   left_finger_tip: left_finger_tip_site
   right_finger_tip: right_finger_tip_site
   hole_entry: hole_entry_site
+  hole_axis: hole_axis_site
 
   topology:
     fin1_parent: link4
