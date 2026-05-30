@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -12,6 +13,9 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from planning.screw_motion import ScrewMotion
 from planning.spiral_search import ArchimedesSpiralSearch
+from planning.vision_error import sample_random_xy_offset
+from task.peg_in_hole.paper_mapping import classify_demo_phase
+from task.peg_in_hole.spiral_trace import SpiralTraceSample, write_spiral_trace_svg
 from task.peg_in_hole.state_machine import PegInHoleContext, PegInHoleState, PegInHoleStateMachine
 
 
@@ -39,6 +43,23 @@ class ArchimedesSpiralSearchTest(unittest.TestCase):
         self.assertAlmostEqual(float(offset[2]), 0.0, places=12)
 
 
+class VisionErrorTest(unittest.TestCase):
+    def test_random_xy_offset_is_inside_disk(self):
+        rng = np.random.default_rng(42)
+        radius = 0.02
+        offsets = [sample_random_xy_offset(radius, rng=rng) for _ in range(100)]
+
+        for offset in offsets:
+            self.assertEqual(offset.shape, (2,))
+            self.assertLessEqual(float(np.linalg.norm(offset)), radius + 1e-12)
+
+    def test_random_xy_offset_is_seed_reproducible(self):
+        a = sample_random_xy_offset(0.02, rng=np.random.default_rng(7))
+        b = sample_random_xy_offset(0.02, rng=np.random.default_rng(7))
+
+        np.testing.assert_allclose(a, b)
+
+
 class ScrewMotionTest(unittest.TestCase):
     def test_depth_and_wiggle_are_bounded(self):
         motion = ScrewMotion(push_depth=0.03, wiggle_amplitude=0.002, screw_amplitude=0.2, duration=5.0, screw_turns=3.0)
@@ -61,7 +82,7 @@ class PegInHoleStateMachineTest(unittest.TestCase):
         machine = PegInHoleStateMachine()
         ctx = PegInHoleContext(alignment_tolerance=0.004, insert_depth_target=0.025)
 
-        self.assertEqual(machine.step(ctx), PegInHoleState.APPROACH_HOLE)
+        self.assertEqual(machine.step(ctx), PegInHoleState.INITIAL_GRASP)
 
         ctx.approach_done = True
         self.assertEqual(machine.step(ctx), PegInHoleState.GRASP_PEG)
@@ -100,6 +121,48 @@ class PegInHoleStateMachineTest(unittest.TestCase):
         self.assertEqual(machine.step(ctx), PegInHoleState.SEARCHING_SPIRAL)
         self.assertEqual(machine.step(ctx), PegInHoleState.FAILED)
         self.assertEqual(machine.failure_reason, "search_timeout")
+
+
+class PaperMappingTest(unittest.TestCase):
+    def test_demo_phases_map_to_paper_steps(self):
+        reaching = classify_demo_phase("reaching_pushing_velocity_contact")
+        searching = classify_demo_phase("searching_rubbing_spiral")
+        inserting = classify_demo_phase("inserting_wiggle_screw")
+        initial = classify_demo_phase("initial_grasp_pose")
+
+        self.assertEqual(initial.procedure_step, "setup")
+        self.assertEqual(reaching.procedure_step, "reaching")
+        self.assertEqual(searching.procedure_step, "searching")
+        self.assertEqual(inserting.procedure_step, "inserting")
+        self.assertIn("rubbing", searching.unit_motion)
+        self.assertIn("screwing", inserting.unit_motion)
+
+
+class SpiralTraceSvgTest(unittest.TestCase):
+    def test_spiral_trace_svg_is_written(self):
+        samples = [
+            SpiralTraceSample(
+                time=float(i),
+                command_xy=np.array([0.001 * i, 0.0005 * i], dtype=float),
+                actual_xy=np.array([0.001 * i, 0.0004 * i], dtype=float),
+                spiral_offset_xy=np.array([0.001 * i, 0.0005 * i], dtype=float),
+                radius=0.001 * i,
+            )
+            for i in range(4)
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "trace.svg"
+            write_spiral_trace_svg(
+                path,
+                samples=samples,
+                initial_offset_xy=np.array([0.01, -0.005], dtype=float),
+                search_radius=0.03,
+                alignment_tolerance=0.004,
+            )
+
+            text = path.read_text(encoding="utf-8")
+            self.assertIn("Archimedes Spiral Rubbing Trace", text)
+            self.assertIn("<polyline", text)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,16 @@
 peg_in_hole:
   reference_paper: Compliance-Based Robotic Peg-in-Hole Assembly Strategy Without Force Feedback
+  reproduction:
+    level: algorithm
+    simulated_vision: hole pose plus random initial XY offset sampled in a bounded disk
+    represented_steps:
+      reaching: pushing
+      searching: pushing + rubbing / Archimedes spiral
+      inserting: pushing + wiggling + screwing
+    limitations:
+      - no Kinect/Canny/Hough visual recognition pipeline
+      - no torque-level compliant controller reproduction
+      - no high-fidelity 0.01 mm clearance contact experiment
   model_xml: models/peg_in_hole_scene.xml
 
   sites:
@@ -8,17 +19,23 @@ peg_in_hole:
     hole_axis: hole_axis_site
 
   geometry:
-    hole_entry_world: [0.0983017899, -0.9704570878, 0.1909713723]
+    hole_entry_world: [0.5111, 0.0565, 0.2371]
+    initial_grasp_q: [1.04, -0.8667, 0.52, 0.0]
+    vertical_tool_seed_q: [-0.52, -0.8667, 0.52, 0.0]
+    shaft_axis_mode: tool
+    # Used as the fixed-offset fallback and as the default random offset radius norm.
     initial_search_offset_xy: [0.016, -0.012]
     pre_insert_clearance: 0.10
-    grasp_to_tip: 0.09
+    # Keep the shaft below the finger midpoint so it is visibly held at the tips,
+    # instead of passing through the upper gripper body.
+    grasp_to_tip: 0.130
     alignment_tolerance: 0.004
-    shaft_radius: 0.010
+    shaft_radius: 0.016
     shaft_half_length: 0.060
 
   state_sequence:
     - idle
-    - approach_hole
+    - initial_grasp
     - grasp_peg
     - move_to_pre_insert
     - reaching_push

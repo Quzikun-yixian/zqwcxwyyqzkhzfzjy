@@ -6,9 +6,9 @@
 - Result: **PASSED**
 - Failure reason: `none`
 - Simulated vision offset mode: `random`
-- Simulated vision XY offset: `[-0.0016  0.0164]` m
+- Simulated vision XY offset: `[-0.0031  0.0098]` m
 - Random offset radius limit: `0.020000` m
-- Random seed: `none`
+- Random seed: `2`
 - Spiral search radius: `0.030000` m
 - Spiral pitch: `0.003000` m/turn
 - Spiral angular speed: `2.000000` rad/s
@@ -18,18 +18,18 @@
 - Screw turns: `3.000`
 - Final XY alignment error: `0.001992` m
 - Alignment tolerance: `0.004000` m
-- Final insertion depth: `0.025066` m
+- Final insertion depth: `0.025062` m
 - Required insertion depth: `0.025000` m
 - Hole XY radius from base: `0.514213` m
-- Final shaft/tool axis: `[-0.0395 -0.0304 -0.9988]`
-- Final tool tilt from world vertical: `2.859` deg
-- Max search radius used: `0.014209` m
-- CSV log: `peg_in_hole_log.csv`
-- Spiral trace image: `peg_in_hole_spiral_trace.svg`
+- Final shaft/tool axis: `[-0.0339 -0.0261 -0.9991]`
+- Final tool tilt from world vertical: `2.452` deg
+- Max search radius used: `0.008231` m
+- CSV log: `peg_in_hole_sweep_random_seed_2_log.csv`
+- Spiral trace image: `peg_in_hole_sweep_random_seed_2_spiral_trace.svg`
 
 ## Spiral Trace
 
-![Archimedes spiral rubbing trace](peg_in_hole_spiral_trace.svg)
+![Archimedes spiral rubbing trace](peg_in_hole_sweep_random_seed_2_spiral_trace.svg)
 
 ## Paper Procedure Mapping
 

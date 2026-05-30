@@ -1,8 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Run a peg-in-hole demo with Archimedes spiral search.
+Run an algorithm-level reproduction of the paper peg-in-hole strategy.
 
-The demo is task-level and intentionally keeps grasping stable with a logical
+The paper workflow is represented as:
+    Reaching  = pushing
+    Searching = pushing + rubbing / Archimedes spiral
+    Inserting = pushing + wiggling + screwing
+
+This demo is task-level and intentionally keeps grasping stable with a logical
 grasp lock after the shaft has been grasped. The search plane is world XY and
 the insertion direction is world Z downward.
 
@@ -36,6 +41,9 @@ from control.admittance_controller import Joint4AdmittanceController
 from planning.joint_trajectory import JointTrajectory
 from planning.screw_motion import ScrewMotion
 from planning.spiral_search import ArchimedesSpiralSearch
+from planning.vision_error import sample_random_xy_offset
+from task.peg_in_hole.paper_mapping import algorithm_reproduction_notes, classify_demo_phase
+from task.peg_in_hole.spiral_trace import SpiralTraceSample, write_spiral_trace_svg
 from task.peg_in_hole.state_machine import PegInHoleContext, PegInHoleState, PegInHoleStateMachine
 
 
@@ -49,6 +57,13 @@ class DemoResult:
     failure_reason: str
     report_path: Path
     csv_path: Path
+    spiral_trace_path: Path
+    initial_offset_xy: np.ndarray
+    offset_mode: str
+    offset_seed: Optional[int]
+    final_shaft_axis: np.ndarray
+    final_tool_tilt_deg: float
+    hole_xy_radius: float
 
 
 def array_str(x: np.ndarray, precision: int = 6) -> str:
@@ -120,32 +135,112 @@ def set_freejoint_pose(model, data, joint_name: str, pos: np.ndarray, quat=None)
     mujoco.mj_forward(model, data)
 
 
-def quat_about_z(angle: float) -> np.ndarray:
-    half = 0.5 * float(angle)
-    return np.array([np.cos(half), 0.0, 0.0, np.sin(half)], dtype=float)
+def rotation_z(angle: float) -> np.ndarray:
+    c = float(np.cos(angle))
+    s = float(np.sin(angle))
+    return np.array(
+        [
+            [c, -s, 0.0],
+            [s, c, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=float,
+    )
+
+
+def quat_from_matrix(rot: np.ndarray) -> np.ndarray:
+    m = np.asarray(rot, dtype=float)
+    trace = float(np.trace(m))
+    if trace > 0.0:
+        s = 0.5 / np.sqrt(trace + 1.0)
+        w = 0.25 / s
+        x = (m[2, 1] - m[1, 2]) * s
+        y = (m[0, 2] - m[2, 0]) * s
+        z = (m[1, 0] - m[0, 1]) * s
+    elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
+        s = 2.0 * np.sqrt(max(0.0, 1.0 + m[0, 0] - m[1, 1] - m[2, 2]))
+        w = (m[2, 1] - m[1, 2]) / s
+        x = 0.25 * s
+        y = (m[0, 1] + m[1, 0]) / s
+        z = (m[0, 2] + m[2, 0]) / s
+    elif m[1, 1] > m[2, 2]:
+        s = 2.0 * np.sqrt(max(0.0, 1.0 + m[1, 1] - m[0, 0] - m[2, 2]))
+        w = (m[0, 2] - m[2, 0]) / s
+        x = (m[0, 1] + m[1, 0]) / s
+        y = 0.25 * s
+        z = (m[1, 2] + m[2, 1]) / s
+    else:
+        s = 2.0 * np.sqrt(max(0.0, 1.0 + m[2, 2] - m[0, 0] - m[1, 1]))
+        w = (m[1, 0] - m[0, 1]) / s
+        x = (m[0, 2] + m[2, 0]) / s
+        y = (m[1, 2] + m[2, 1]) / s
+        z = 0.25 * s
+    quat = np.array([w, x, y, z], dtype=float)
+    return quat / max(1e-12, float(np.linalg.norm(quat)))
+
+
+def site_rotation(api: ArmPlatformAPI, site_name: str) -> np.ndarray:
+    sid = get_id(api.model, mujoco.mjtObj.mjOBJ_SITE, site_name)
+    mujoco.mj_forward(api.model, api.data)
+    return api.data.site_xmat[sid].reshape(3, 3).copy()
 
 
 def grasp_site_pos(api: ArmPlatformAPI, peg_tip_site: str) -> np.ndarray:
-    return get_site_pos(api.model, api.data, peg_tip_site)
+    del peg_tip_site
+    left = get_site_pos(api.model, api.data, "left_finger_tip_site")
+    right = get_site_pos(api.model, api.data, "right_finger_tip_site")
+    return 0.5 * (left + right)
 
 
-def shaft_tip_pos(api: ArmPlatformAPI, peg_tip_site: str, grasp_to_tip: float) -> np.ndarray:
-    return grasp_site_pos(api, peg_tip_site) - np.array([0.0, 0.0, grasp_to_tip], dtype=float)
+def tool_shaft_axis(api: ArmPlatformAPI, peg_tip_site: str) -> np.ndarray:
+    rot = site_rotation(api, peg_tip_site)
+    axis = -rot[:, 1]
+    return axis / max(1e-12, float(np.linalg.norm(axis)))
+
+
+def hole_axis_vector(api: ArmPlatformAPI, hole_entry_site: str, hole_axis_site: str) -> np.ndarray:
+    entry = get_site_pos(api.model, api.data, hole_entry_site)
+    axis_point = get_site_pos(api.model, api.data, hole_axis_site)
+    axis = axis_point - entry
+    return axis / max(1e-12, float(np.linalg.norm(axis)))
+
+
+def shaft_tip_pos(
+    api: ArmPlatformAPI,
+    peg_tip_site: str,
+    grasp_to_tip: float,
+    shaft_axis_world: np.ndarray,
+) -> np.ndarray:
+    return grasp_site_pos(api, peg_tip_site) + grasp_to_tip * shaft_axis_world
 
 
 def apply_grasp_lock(
     api: ArmPlatformAPI,
     peg_tip_site: str,
-    object_center_offset: np.ndarray,
+    shaft_half_length: float,
+    grasp_to_tip: float,
+    shaft_axis_world: np.ndarray,
     screw_angle: float = 0.0,
 ) -> None:
     grasp_pos = grasp_site_pos(api, peg_tip_site)
+    axis = shaft_axis_world / max(1e-12, float(np.linalg.norm(shaft_axis_world)))
+    center = grasp_pos + (grasp_to_tip - shaft_half_length) * axis
+
+    tool_rot = site_rotation(api, peg_tip_site)
+    radial_x = tool_rot[:, 0] - axis * float(np.dot(tool_rot[:, 0], axis))
+    if np.linalg.norm(radial_x) < 1e-9:
+        radial_x = np.array([1.0, 0.0, 0.0], dtype=float) - axis * axis[0]
+    radial_x = radial_x / max(1e-12, float(np.linalg.norm(radial_x)))
+    radial_y = np.cross(axis, radial_x)
+    radial_y = radial_y / max(1e-12, float(np.linalg.norm(radial_y)))
+    base_rot = np.column_stack([radial_x, radial_y, axis])
+    object_rot = base_rot @ rotation_z(screw_angle)
     set_freejoint_pose(
         api.model,
         api.data,
         "grasp_object_freejoint",
-        grasp_pos + object_center_offset,
-        quat=quat_about_z(screw_angle),
+        center,
+        quat=quat_from_matrix(object_rot),
     )
 
 
@@ -153,6 +248,31 @@ def pseudo_contact_force(peg_tip: np.ndarray, hole_entry: np.ndarray, stiffness:
     contact_plane_z = float(hole_entry[2] + contact_tolerance)
     penetration = max(0.0, contact_plane_z - float(peg_tip[2]))
     return float(stiffness * penetration)
+
+
+def safe_log_stem(value: str) -> str:
+    stem = str(value or "peg_in_hole").strip()
+    cleaned = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in stem)
+    return cleaned or "peg_in_hole"
+
+
+def resolve_initial_offset(args, geom_cfg: dict, search_cfg: dict) -> tuple[np.ndarray, str, Optional[int], float]:
+    configured_fixed = np.array(geom_cfg["initial_search_offset_xy"], dtype=float)
+    mode = str(getattr(args, "offset_mode", "random")).lower()
+    explicit_offset = getattr(args, "initial_offset_xy", None)
+    if explicit_offset is not None:
+        return np.array(explicit_offset, dtype=float), "fixed", None, float(getattr(args, "offset_radius", 0.0))
+
+    offset_radius = float(getattr(args, "offset_radius", 0.0))
+    if offset_radius <= 0.0:
+        offset_radius = min(float(np.linalg.norm(configured_fixed)), float(search_cfg["radius_max"]))
+
+    if mode == "fixed":
+        return configured_fixed, "fixed", None, offset_radius
+
+    seed = getattr(args, "seed", None)
+    rng = np.random.default_rng(seed)
+    return sample_random_xy_offset(offset_radius, rng=rng), "random", seed, offset_radius
 
 
 def load_task_config(path: Path) -> dict:
@@ -179,22 +299,61 @@ def write_report(
     target_force: float,
     alignment_tolerance: float,
     success_depth: float,
+    initial_offset_xy: np.ndarray,
+    search_radius: float,
+    spiral_pitch: float,
+    spiral_angular_speed: float,
+    velocity_threshold: float,
+    velocity_hold_time: float,
+    wiggle_amplitude: float,
+    screw_turns: float,
+    offset_mode: str,
+    offset_seed: Optional[int],
+    offset_radius: float,
+    spiral_trace_path: Path,
+    final_shaft_axis: np.ndarray,
+    final_tool_tilt_deg: float,
+    hole_xy_radius: float,
 ) -> None:
     lines = []
-    lines.append("# Peg-in-Hole Archimedes Spiral Demo Report\n")
+    lines.append("# Peg-in-Hole Paper Algorithm Reproduction Report\n")
+    lines.append("- Reference paper: `Compliance-Based Robotic Peg-in-Hole Assembly Strategy Without Force Feedback`")
+    lines.append("- Reproduction level: `algorithm-level simulation`")
     lines.append(f"- Final state: `{result.final_state.name}`")
     lines.append(f"- Result: **{'PASSED' if result.passed else 'FAILED'}**")
     lines.append(f"- Failure reason: `{result.failure_reason or 'none'}`")
+    lines.append(f"- Simulated vision offset mode: `{offset_mode}`")
+    lines.append(f"- Simulated vision XY offset: `{array_str(initial_offset_xy, precision=4)}` m")
+    lines.append(f"- Random offset radius limit: `{offset_radius:.6f}` m")
+    lines.append(f"- Random seed: `{offset_seed if offset_seed is not None else 'none'}`")
+    lines.append(f"- Spiral search radius: `{search_radius:.6f}` m")
+    lines.append(f"- Spiral pitch: `{spiral_pitch:.6f}` m/turn")
+    lines.append(f"- Spiral angular speed: `{spiral_angular_speed:.6f}` rad/s")
     lines.append(f"- Target contact force: `{target_force:.3f}` N")
+    lines.append(f"- Velocity/contact threshold: `{velocity_threshold:.6f}` m/s for `{velocity_hold_time:.3f}` s")
+    lines.append(f"- Wiggle amplitude: `{wiggle_amplitude:.6f}` m")
+    lines.append(f"- Screw turns: `{screw_turns:.3f}`")
     lines.append(f"- Final XY alignment error: `{result.final_alignment_error:.6f}` m")
     lines.append(f"- Alignment tolerance: `{alignment_tolerance:.6f}` m")
     lines.append(f"- Final insertion depth: `{result.final_insertion_depth:.6f}` m")
     lines.append(f"- Required insertion depth: `{success_depth:.6f}` m")
+    lines.append(f"- Hole XY radius from base: `{hole_xy_radius:.6f}` m")
+    lines.append(f"- Final shaft/tool axis: `{array_str(final_shaft_axis, precision=4)}`")
+    lines.append(f"- Final tool tilt from world vertical: `{final_tool_tilt_deg:.3f}` deg")
     lines.append(f"- Max search radius used: `{result.max_search_radius_used:.6f}` m")
+    lines.append(f"- CSV log: `{result.csv_path.name}`")
+    lines.append(f"- Spiral trace image: `{spiral_trace_path.name}`")
+    lines.append("\n## Spiral Trace\n")
+    lines.append(f"![Archimedes spiral rubbing trace]({spiral_trace_path.name})")
+    lines.append("\n## Paper Procedure Mapping\n")
+    lines.append("| Paper step | Unit motion represented in this demo |")
+    lines.append("| --- | --- |")
+    lines.append("| Setup | initial gripper grasp, then carry peg to estimated hole pose |")
+    lines.append("| Reaching | pushing |")
+    lines.append("| Searching | pushing + rubbing / Archimedes spiral |")
+    lines.append("| Inserting | pushing + wiggling + screwing |")
     lines.append("\n## Notes\n")
-    lines.append("The search trajectory is an Archimedes spiral in the world XY plane.")
-    lines.append("The shaft is kept attached to the gripper with logical grasp lock after grasping.")
-    lines.append("The contact force used by the joint4 admittance loop is computed from tip penetration into the hole-entry plane for deterministic task-level validation.")
+    lines.extend(algorithm_reproduction_notes())
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
@@ -210,26 +369,33 @@ def run_demo(args, viewer=None, api: Optional[ArmPlatformAPI] = None) -> DemoRes
     model_path = (PROJECT_ROOT / args.model).resolve()
     log_dir = PROJECT_ROOT / "logs"
     log_dir.mkdir(exist_ok=True)
-    csv_path = log_dir / "peg_in_hole_log.csv"
-    report_path = log_dir / "peg_in_hole_report.md"
+    log_stem = safe_log_stem(getattr(args, "log_stem", "peg_in_hole"))
+    csv_path = log_dir / f"{log_stem}_log.csv"
+    report_path = log_dir / f"{log_stem}_report.md"
+    spiral_trace_path = log_dir / f"{log_stem}_spiral_trace.svg"
 
     if api is None:
         api = ArmPlatformAPI(model_path)
     open_cmd, close_cmd = detect_open_close_commands(api)
+    close_cmd = 0.04 if close_cmd >= 0.0 else -0.04
 
     peg_tip_site = site_cfg["peg_tip"]
     hole_entry_site = site_cfg["hole_entry"]
+    hole_axis_site = site_cfg["hole_axis"]
 
     hole_entry = get_site_pos(api.model, api.data, hole_entry_site)
-    initial_offset = np.array(args.initial_offset_xy, dtype=float)
+    initial_offset, offset_mode, offset_seed, offset_radius = resolve_initial_offset(args, geom_cfg, search_cfg)
+    shaft_axis_mode = str(geom_cfg.get("shaft_axis_mode", "hole")).lower()
     shaft_half_length = float(geom_cfg["shaft_half_length"])
     grasp_to_tip = float(geom_cfg["grasp_to_tip"])
-    object_center_offset = np.array([0.0, 0.0, shaft_half_length - grasp_to_tip], dtype=float)
     pre_insert_clearance = float(geom_cfg["pre_insert_clearance"])
     alignment_tolerance = float(args.alignment_tolerance)
     contact_tolerance = float(args.contact_tolerance)
     success_depth = float(args.success_depth)
     pseudo_stiffness = float(force_cfg["pseudo_contact_stiffness"])
+    velocity_threshold = float(contact_cfg["velocity_threshold"])
+    velocity_hold_required = float(contact_cfg["hold_time"])
+    use_kinematic_velocity = bool(contact_cfg.get("use_kinematic_velocity", True))
     dt = float(args.dt)
 
     spiral = ArchimedesSpiralSearch(
@@ -239,10 +405,10 @@ def run_demo(args, viewer=None, api: Optional[ArmPlatformAPI] = None) -> DemoRes
     )
     screw = ScrewMotion(
         push_depth=float(args.insert_depth),
-        screw_amplitude=float(insertion_cfg["screw_amplitude_rad"]),
-        duration=float(insertion_cfg["duration"]),
-        wiggle_amplitude=float(insertion_cfg["wiggle_amplitude"]),
-        screw_turns=float(insertion_cfg["screw_turns"]),
+        screw_amplitude=float(args.screw_amplitude),
+        duration=float(args.insert_duration),
+        wiggle_amplitude=float(args.wiggle_amplitude),
+        screw_turns=float(args.screw_turns),
     )
 
     machine = PegInHoleStateMachine()
@@ -256,11 +422,40 @@ def run_demo(args, viewer=None, api: Optional[ArmPlatformAPI] = None) -> DemoRes
 
     sim_time = 0.0
     state_enter_time = 0.0
+    target_seed_q = np.array(geom_cfg.get("vertical_tool_seed_q", api.get_state().q_arm), dtype=float)
+    initial_grasp_q = np.array(geom_cfg.get("initial_grasp_q", target_seed_q), dtype=float)
+    set_q_arm_kinematic(api, target_seed_q)
+    target_tool_quat = quat_from_matrix(site_rotation(api, peg_tip_site))
+    set_q_arm_kinematic(api, initial_grasp_q)
     current_q = api.get_state().q_arm.copy()
     max_search_radius_used = 0.0
     last_spiral_offset = np.zeros(2, dtype=float)
     last_wiggle_offset = np.zeros(2, dtype=float)
     last_screw_angle = 0.0
+    spiral_trace_samples: list[SpiralTraceSample] = []
+    last_observed_tip: Optional[np.ndarray] = None
+    last_observed_time: Optional[float] = None
+    peg_speed = 0.0
+    velocity_hold_elapsed = 0.0
+    velocity_condition_met = False
+
+    def current_shaft_axis() -> np.ndarray:
+        if shaft_axis_mode == "tool":
+            return tool_shaft_axis(api, peg_tip_site)
+        return hole_axis_vector(api, hole_entry_site, hole_axis_site)
+
+    def current_shaft_tip() -> np.ndarray:
+        return shaft_tip_pos(api, peg_tip_site, grasp_to_tip, current_shaft_axis())
+
+    def apply_current_grasp_lock(screw_angle: float = 0.0) -> None:
+        apply_grasp_lock(
+            api,
+            peg_tip_site,
+            shaft_half_length,
+            grasp_to_tip,
+            current_shaft_axis(),
+            screw_angle=screw_angle,
+        )
 
     def machine_step() -> PegInHoleState:
         nonlocal state_enter_time
@@ -272,21 +467,52 @@ def run_demo(args, viewer=None, api: Optional[ArmPlatformAPI] = None) -> DemoRes
         return new
 
     def update_context() -> None:
-        peg = shaft_tip_pos(api, peg_tip_site, grasp_to_tip)
+        nonlocal last_observed_tip, last_observed_time, peg_speed, velocity_hold_elapsed, velocity_condition_met
+        peg = current_shaft_tip()
         ctx.time = sim_time
         ctx.state_elapsed = sim_time - state_enter_time
         ctx.alignment_error_xy = float(np.linalg.norm(peg[:2] - hole_entry[:2]))
         ctx.insertion_depth = max(0.0, float(hole_entry[2] - peg[2]))
-        ctx.contact_force = pseudo_contact_force(peg, hole_entry, pseudo_stiffness, contact_tolerance)
-        ctx.contact_detected = ctx.contact_detected or ctx.contact_force > 0.05 or peg[2] <= hole_entry[2] + contact_tolerance
+        near_contact_xy = ctx.alignment_error_xy <= max(
+            0.06,
+            float(args.search_radius) + offset_radius + alignment_tolerance,
+        )
+        raw_contact_force = pseudo_contact_force(peg, hole_entry, pseudo_stiffness, contact_tolerance)
+        ctx.contact_force = raw_contact_force if near_contact_xy else 0.0
+        if last_observed_tip is not None and last_observed_time is not None:
+            elapsed = sim_time - last_observed_time
+            if elapsed > 1e-9:
+                peg_speed = float(np.linalg.norm(peg - last_observed_tip) / elapsed)
+                if peg_speed <= velocity_threshold:
+                    velocity_hold_elapsed += elapsed
+                else:
+                    velocity_hold_elapsed = 0.0
+                velocity_condition_met = velocity_hold_elapsed >= velocity_hold_required
+        last_observed_tip = peg.copy()
+        last_observed_time = sim_time
+
+        geometric_contact = near_contact_xy and (
+            ctx.contact_force > 0.05 or peg[2] <= hole_entry[2] + contact_tolerance
+        )
+        velocity_contact = (
+            use_kinematic_velocity
+            and velocity_condition_met
+            and near_contact_xy
+            and peg[2] <= hole_entry[2] + contact_tolerance
+        )
+        ctx.contact_detected = ctx.contact_detected or geometric_contact or velocity_contact
 
     def write_log(writer, phase: str) -> None:
-        peg = shaft_tip_pos(api, peg_tip_site, grasp_to_tip)
+        peg = current_shaft_tip()
         state = api.get_state()
+        paper_phase = classify_demo_phase(phase, machine.state.name)
         writer.writerow([
             sim_time,
             machine.state.name,
             phase,
+            paper_phase.procedure_step,
+            paper_phase.unit_motion,
+            paper_phase.condition,
             state.q_arm[0],
             state.q_arm[1],
             state.q_arm[2],
@@ -300,6 +526,8 @@ def run_demo(args, viewer=None, api: Optional[ArmPlatformAPI] = None) -> DemoRes
             ctx.alignment_error_xy,
             ctx.insertion_depth,
             ctx.contact_force,
+            peg_speed,
+            int(velocity_condition_met),
             last_spiral_offset[0],
             last_spiral_offset[1],
             ctx.search_radius,
@@ -309,17 +537,57 @@ def run_demo(args, viewer=None, api: Optional[ArmPlatformAPI] = None) -> DemoRes
             machine.failure_reason,
         ])
 
-    def set_target_by_ik(target_pos: np.ndarray, q_init: np.ndarray) -> np.ndarray:
-        ik = api.ik_position(target_pos, q_init=q_init, site_name=peg_tip_site)
-        if not ik.success and ik.error_norm > args.ik_tolerance:
+    def set_tip_target_by_ik(target_tip_pos: np.ndarray, q_init: np.ndarray) -> np.ndarray:
+        q_seed = np.asarray(q_init, dtype=float).copy()
+        ik = None
+        tip_error = float("inf")
+        for _ in range(3):
+            set_q_arm_kinematic(api, q_seed)
+            grasp_target = target_tip_pos - grasp_to_tip * current_shaft_axis()
+            grasp_to_ik_site = get_site_pos(api.model, api.data, peg_tip_site) - grasp_site_pos(api, peg_tip_site)
+            ik_site_target = grasp_target + grasp_to_ik_site
+            ik = api.ik_position(ik_site_target, q_init=q_seed, site_name=peg_tip_site)
+            candidates = [ik.q.copy()]
+            if shaft_axis_mode == "tool":
+                pose_ik = api.kin.solve_ik_pose(
+                    ik_site_target,
+                    target_tool_quat,
+                    q_init=ik.q,
+                    site_name=peg_tip_site,
+                    pos_weight=1.0,
+                    rot_weight=0.12,
+                    max_iter=60,
+                    tol=max(5e-4, args.ik_tolerance),
+                    step_scale=0.35,
+                )
+                candidates.append(pose_ik.q.copy())
+
+            best_candidate = None
+            best_score = float("inf")
+            for candidate in candidates:
+                set_q_arm_kinematic(api, candidate)
+                candidate_tip_error = float(np.linalg.norm(target_tip_pos - current_shaft_tip()))
+                candidate_axis = current_shaft_axis()
+                candidate_tilt = 1.0 - abs(float(candidate_axis[2]))
+                score = candidate_tip_error + 0.05 * candidate_tilt
+                if score < best_score:
+                    best_score = score
+                    best_candidate = candidate.copy()
+                    tip_error = candidate_tip_error
+
+            q_seed = best_candidate
+            set_q_arm_kinematic(api, q_seed)
+            if tip_error <= args.ik_tolerance:
+                break
+        if ik is None or (not ik.success and tip_error > args.ik_tolerance):
             ctx.ik_failed = True
             machine_step()
-            raise RuntimeError(f"IK failed for target {array_str(target_pos)}; error={ik.error_norm:.6g}")
-        return ik.q.copy()
+            raise RuntimeError(f"IK failed for shaft tip target {array_str(target_tip_pos)}; tip_error={tip_error:.6g}")
+        return q_seed.copy()
 
-    def animate_to(target_pos: np.ndarray, duration: float, phase: str, writer, lock_object: bool) -> np.ndarray:
+    def animate_to(target_tip_pos: np.ndarray, duration: float, phase: str, writer, lock_object: bool) -> np.ndarray:
         nonlocal sim_time, current_q
-        q_goal = set_target_by_ik(target_pos, current_q)
+        q_goal = set_tip_target_by_ik(target_tip_pos, current_q)
         traj = JointTrajectory(current_q, q_goal, max(dt, duration), method="quintic")
         steps = max(1, int(duration / dt))
         for k in range(steps + 1):
@@ -327,7 +595,7 @@ def run_demo(args, viewer=None, api: Optional[ArmPlatformAPI] = None) -> DemoRes
             q = traj.sample(u_time)
             set_q_arm_kinematic(api, q)
             if lock_object:
-                apply_grasp_lock(api, peg_tip_site, object_center_offset, screw_angle=last_screw_angle)
+                apply_current_grasp_lock(screw_angle=last_screw_angle)
             update_context()
             write_log(writer, phase)
             if not sync_viewer(viewer, args.no_sleep, dt):
@@ -336,7 +604,7 @@ def run_demo(args, viewer=None, api: Optional[ArmPlatformAPI] = None) -> DemoRes
         current_q = q_goal
         set_q_arm_kinematic(api, current_q)
         if lock_object:
-            apply_grasp_lock(api, peg_tip_site, object_center_offset, screw_angle=last_screw_angle)
+            apply_current_grasp_lock(screw_angle=last_screw_angle)
         update_context()
         return current_q
 
@@ -346,6 +614,9 @@ def run_demo(args, viewer=None, api: Optional[ArmPlatformAPI] = None) -> DemoRes
             "time",
             "state",
             "phase",
+            "paper_step",
+            "unit_motion",
+            "paper_condition",
             "q1",
             "q2",
             "q3",
@@ -359,6 +630,8 @@ def run_demo(args, viewer=None, api: Optional[ArmPlatformAPI] = None) -> DemoRes
             "alignment_error_xy",
             "insertion_depth",
             "contact_force",
+            "peg_speed",
+            "velocity_condition_met",
             "spiral_x",
             "spiral_y",
             "spiral_radius",
@@ -373,31 +646,38 @@ def run_demo(args, viewer=None, api: Optional[ArmPlatformAPI] = None) -> DemoRes
         pre_insert_target = hole_entry + np.array([
             initial_offset[0],
             initial_offset[1],
-            grasp_to_tip + pre_insert_clearance,
+            pre_insert_clearance,
         ])
 
         set_slide_pair_direct(api.model, api.data, open_cmd)
-        current_q = animate_to(pre_insert_target, duration=2.0, phase="approach_hole", writer=writer, lock_object=False)
+        set_q_arm_kinematic(api, current_q)
+        apply_current_grasp_lock(screw_angle=last_screw_angle)
+        for _ in range(max(1, int(0.6 / dt))):
+            update_context()
+            write_log(writer, "initial_grasp_pose")
+            if not sync_viewer(viewer, args.no_sleep, dt):
+                break
+            sim_time += dt
         ctx.approach_done = True
         machine_step()
 
         set_slide_pair_direct(api.model, api.data, close_cmd)
-        apply_grasp_lock(api, peg_tip_site, object_center_offset, screw_angle=last_screw_angle)
+        apply_current_grasp_lock(screw_angle=last_screw_angle)
         for _ in range(max(1, int(0.4 / dt))):
             update_context()
-            write_log(writer, "grasp_peg")
+            write_log(writer, "close_initial_grasp")
             if not sync_viewer(viewer, args.no_sleep, dt):
                 break
             sim_time += dt
         ctx.grasp_done = True
         machine_step()
 
-        current_q = animate_to(pre_insert_target, duration=0.4, phase="move_to_pre_insert", writer=writer, lock_object=True)
+        current_q = animate_to(pre_insert_target, duration=2.4, phase="carry_to_pre_insert", writer=writer, lock_object=True)
         ctx.pre_insert_done = True
         machine_step()
 
-        contact_target = hole_entry + np.array([initial_offset[0], initial_offset[1], grasp_to_tip], dtype=float)
-        current_q = animate_to(contact_target, duration=2.0, phase="reach_contact_plane", writer=writer, lock_object=True)
+        contact_target = hole_entry + np.array([initial_offset[0], initial_offset[1], 0.0], dtype=float)
+        current_q = animate_to(contact_target, duration=2.0, phase="reaching_pushing", writer=writer, lock_object=True)
 
         down_test = current_q.copy()
         up_test = current_q.copy()
@@ -405,12 +685,12 @@ def run_demo(args, viewer=None, api: Optional[ArmPlatformAPI] = None) -> DemoRes
         down_test[3] = min(high[3], current_q[3] + 0.01)
         up_test[3] = max(low[3], current_q[3] - 0.01)
         set_q_arm_kinematic(api, down_test)
-        z_plus = shaft_tip_pos(api, peg_tip_site, grasp_to_tip)[2]
+        z_plus = current_shaft_tip()[2]
         set_q_arm_kinematic(api, up_test)
-        z_minus = shaft_tip_pos(api, peg_tip_site, grasp_to_tip)[2]
+        z_minus = current_shaft_tip()[2]
         down_sign = 1.0 if z_plus < z_minus else -1.0
         set_q_arm_kinematic(api, current_q)
-        apply_grasp_lock(api, peg_tip_site, object_center_offset, screw_angle=last_screw_angle)
+        apply_current_grasp_lock(screw_angle=last_screw_angle)
 
         admittance = Joint4AdmittanceController(
             initial_command=float(current_q[3]),
@@ -432,9 +712,9 @@ def run_demo(args, viewer=None, api: Optional[ArmPlatformAPI] = None) -> DemoRes
             q_cmd[3] = ctrl.command
             set_q_arm_kinematic(api, q_cmd)
             current_q = q_cmd
-            apply_grasp_lock(api, peg_tip_site, object_center_offset, screw_angle=last_screw_angle)
+            apply_current_grasp_lock(screw_angle=last_screw_angle)
             update_context()
-            write_log(writer, "joint4_admittance_contact")
+            write_log(writer, "reaching_pushing_velocity_contact")
             if not sync_viewer(viewer, args.no_sleep, dt):
                 break
             sim_time += dt
@@ -456,21 +736,29 @@ def run_demo(args, viewer=None, api: Optional[ArmPlatformAPI] = None) -> DemoRes
 
             target_xy = hole_entry[:2] + initial_offset + last_spiral_offset
             target_tip_z = hole_entry[2] - max(ctx.insertion_depth, args.target_force / pseudo_stiffness)
-            target = np.array([target_xy[0], target_xy[1], target_tip_z + grasp_to_tip], dtype=float)
-            current_q = set_target_by_ik(target, current_q)
+            target = np.array([target_xy[0], target_xy[1], target_tip_z], dtype=float)
+            current_q = set_tip_target_by_ik(target, current_q)
             set_q_arm_kinematic(api, current_q)
-            apply_grasp_lock(api, peg_tip_site, object_center_offset, screw_angle=last_screw_angle)
+            apply_current_grasp_lock(screw_angle=last_screw_angle)
             update_context()
-            write_log(writer, "archimedes_spiral_search")
+            actual_tip = current_shaft_tip()
+            spiral_trace_samples.append(SpiralTraceSample(
+                time=float(t_search),
+                command_xy=target_xy - hole_entry[:2],
+                actual_xy=actual_tip[:2] - hole_entry[:2],
+                spiral_offset_xy=last_spiral_offset.copy(),
+                radius=float(ctx.search_radius),
+            ))
+            write_log(writer, "searching_rubbing_spiral")
             machine_step()
             if not sync_viewer(viewer, args.no_sleep, dt):
                 break
             sim_time += dt
 
         insert_start = sim_time
-        insert_start_offset = shaft_tip_pos(api, peg_tip_site, grasp_to_tip)[:2] - hole_entry[:2]
+        insert_start_offset = current_shaft_tip()[:2] - hole_entry[:2]
         insert_start_depth = ctx.insertion_depth
-        handoff_duration = max(dt, float(insertion_cfg["handoff_duration"]))
+        handoff_duration = max(dt, float(args.handoff_duration))
         while machine.state == PegInHoleState.INSERTING_WIGGLE_SCREW and sim_time <= args.max_time:
             t_insert = sim_time - insert_start
             cmd = screw.sample_command(t_insert)
@@ -481,12 +769,12 @@ def run_demo(args, viewer=None, api: Optional[ArmPlatformAPI] = None) -> DemoRes
             smooth_offset = (1.0 - blend) * insert_start_offset + blend * cmd.wiggle_offset
             target_xy = hole_entry[:2] + smooth_offset
             target_tip_z = hole_entry[2] - (insert_start_depth + cmd.insertion_depth)
-            target = np.array([target_xy[0], target_xy[1], target_tip_z + grasp_to_tip], dtype=float)
-            current_q = set_target_by_ik(target, current_q)
+            target = np.array([target_xy[0], target_xy[1], target_tip_z], dtype=float)
+            current_q = set_tip_target_by_ik(target, current_q)
             set_q_arm_kinematic(api, current_q)
-            apply_grasp_lock(api, peg_tip_site, object_center_offset, screw_angle=last_screw_angle)
+            apply_current_grasp_lock(screw_angle=last_screw_angle)
             update_context()
-            write_log(writer, "wiggle_screw_insert")
+            write_log(writer, "inserting_wiggle_screw")
             machine_step()
             if not sync_viewer(viewer, args.no_sleep, dt):
                 break
@@ -506,6 +794,10 @@ def run_demo(args, viewer=None, api: Optional[ArmPlatformAPI] = None) -> DemoRes
         and ctx.insertion_depth >= success_depth
     )
 
+    final_shaft_axis = current_shaft_axis()
+    final_tool_tilt_deg = float(np.degrees(np.arccos(np.clip(abs(final_shaft_axis[2]), -1.0, 1.0))))
+    hole_xy_radius = float(np.linalg.norm(hole_entry[:2]))
+
     result = DemoResult(
         passed=bool(passed),
         final_state=machine.state,
@@ -515,6 +807,20 @@ def run_demo(args, viewer=None, api: Optional[ArmPlatformAPI] = None) -> DemoRes
         failure_reason=ctx.failure_reason or machine.failure_reason,
         report_path=report_path,
         csv_path=csv_path,
+        spiral_trace_path=spiral_trace_path,
+        initial_offset_xy=initial_offset.copy(),
+        offset_mode=offset_mode,
+        offset_seed=offset_seed,
+        final_shaft_axis=final_shaft_axis.copy(),
+        final_tool_tilt_deg=final_tool_tilt_deg,
+        hole_xy_radius=hole_xy_radius,
+    )
+    write_spiral_trace_svg(
+        spiral_trace_path,
+        samples=spiral_trace_samples,
+        initial_offset_xy=initial_offset,
+        search_radius=float(args.search_radius),
+        alignment_tolerance=alignment_tolerance,
     )
     write_report(
         report_path,
@@ -522,6 +828,21 @@ def run_demo(args, viewer=None, api: Optional[ArmPlatformAPI] = None) -> DemoRes
         target_force=float(args.target_force),
         alignment_tolerance=alignment_tolerance,
         success_depth=success_depth,
+        initial_offset_xy=initial_offset,
+        search_radius=float(args.search_radius),
+        spiral_pitch=float(args.spiral_pitch),
+        spiral_angular_speed=float(args.spiral_angular_speed),
+        velocity_threshold=velocity_threshold,
+        velocity_hold_time=velocity_hold_required,
+        wiggle_amplitude=float(args.wiggle_amplitude),
+        screw_turns=float(args.screw_turns),
+        offset_mode=offset_mode,
+        offset_seed=offset_seed,
+        offset_radius=offset_radius,
+        spiral_trace_path=spiral_trace_path,
+        final_shaft_axis=final_shaft_axis,
+        final_tool_tilt_deg=final_tool_tilt_deg,
+        hole_xy_radius=hole_xy_radius,
     )
     return result
 
@@ -544,30 +865,47 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--spiral-pitch", type=float, default=float(search_cfg["pitch"]))
     parser.add_argument("--spiral-angular-speed", type=float, default=float(search_cfg["angular_speed"]))
     parser.add_argument("--insert-depth", type=float, default=float(insertion_cfg["push_depth"]))
+    parser.add_argument("--insert-duration", type=float, default=float(insertion_cfg["duration"]))
+    parser.add_argument("--handoff-duration", type=float, default=float(insertion_cfg["handoff_duration"]))
+    parser.add_argument("--wiggle-amplitude", type=float, default=float(insertion_cfg["wiggle_amplitude"]))
+    parser.add_argument("--screw-amplitude", type=float, default=float(insertion_cfg["screw_amplitude_rad"]))
+    parser.add_argument("--screw-turns", type=float, default=float(insertion_cfg["screw_turns"]))
     parser.add_argument("--success-depth", type=float, default=float(insertion_cfg["success_depth"]))
     parser.add_argument("--target-force", type=float, default=float(force_cfg["target_force"]))
     parser.add_argument("--alignment-tolerance", type=float, default=float(geom_cfg["alignment_tolerance"]))
     parser.add_argument("--contact-tolerance", type=float, default=float(contact_cfg["contact_tolerance"]))
     parser.add_argument("--ik-tolerance", type=float, default=0.002)
+    parser.add_argument("--offset-mode", choices=("random", "fixed"), default="random")
+    parser.add_argument(
+        "--offset-radius",
+        type=float,
+        default=min(float(np.linalg.norm(geom_cfg["initial_search_offset_xy"])), float(search_cfg["radius_max"])),
+        help="Maximum random coarse-vision XY error in meters.",
+    )
+    parser.add_argument("--seed", type=int, default=None, help="Seed for random initial XY offset.")
     parser.add_argument(
         "--initial-offset-xy",
         type=float,
         nargs=2,
-        default=list(geom_cfg["initial_search_offset_xy"]),
+        default=None,
         metavar=("DX", "DY"),
+        help="Use a fixed initial XY offset and bypass random offset sampling.",
     )
+    parser.add_argument("--log-stem", type=str, default="peg_in_hole")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     print("=" * 80)
-    print("Peg-in-Hole Archimedes Spiral Demo")
+    print("Peg-in-Hole Paper Algorithm Reproduction Demo")
     print("=" * 80)
     print(f"Model: {PROJECT_ROOT / args.model}")
     print(f"Headless: {args.headless}")
+    print(f"Offset mode={args.offset_mode}, offset_radius={args.offset_radius:.4f}, seed={args.seed}")
     print(f"Spiral radius={args.search_radius:.4f}, pitch={args.spiral_pitch:.4f}, angular_speed={args.spiral_angular_speed:.4f}")
     print(f"Target force={args.target_force:.3f} N, insert_depth={args.insert_depth:.4f} m")
+    print("Paper mapping: reaching=pushing, searching=pushing+rubbing, inserting=pushing+wiggling+screwing")
 
     if args.headless:
         result = run_demo(args, viewer=None)
@@ -582,8 +920,13 @@ def main() -> None:
     print(f"Final XY alignment error: {result.final_alignment_error:.6f} m")
     print(f"Final insertion depth: {result.final_insertion_depth:.6f} m")
     print(f"Max search radius used: {result.max_search_radius_used:.6f} m")
+    print(f"Sampled initial XY offset: {array_str(result.initial_offset_xy, precision=6)} m")
+    print(f"Hole XY radius from base: {result.hole_xy_radius:.6f} m")
+    print(f"Final shaft/tool axis: {array_str(result.final_shaft_axis, precision=6)}")
+    print(f"Final tool tilt from world vertical: {result.final_tool_tilt_deg:.3f} deg")
     print(f"Report: {result.report_path}")
     print(f"CSV log: {result.csv_path}")
+    print(f"Spiral trace: {result.spiral_trace_path}")
     print(f"Result: {'PASSED' if result.passed else 'FAILED'}")
     print("=" * 80)
 

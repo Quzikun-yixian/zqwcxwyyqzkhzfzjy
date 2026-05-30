@@ -44,7 +44,7 @@
                 <inertial pos="0.04 -0.03686046512 0.0175" mass="0.301" fullinertia="0.0002197935562 0.0002703604167 0.0004286998062 -1.558540623e-19 -1.423015351e-19 1.93123512e-19" />
                 <geom name="fin1_visual" type="mesh" mesh="fin1" rgba="1 1 1 1" contype="0" conaffinity="0" group="1" density="0" />
                 <site name="left_finger_tip_site" pos="0.04 -0.035 0.035" size="0.006" rgba="0.8 0 0 1" />
-                <geom name="fin1_finger_collision" type="box" pos="0.04 -0.035 0.035" size="0.012 0.018 0.035" rgba="0 1 0 0.25" friction="2.0 0.02 0.002" condim="4" />
+                <geom name="fin1_finger_collision" type="box" pos="0.04 -0.035 0.035" size="0.006 0.010 0.020" rgba="0 0.8 0 0.08" friction="2.0 0.02 0.002" condim="4" />
               </body>
               <body name="fin2" pos="-0.1 0.04 0.32" quat="0.4999981634 -0.5 0.5000018366 -0.5">
                 <joint name="joint6" type="slide" axis="0 0 1" range="-0.04 0.04" limited="true" actuatorfrcrange="-100 100" />
@@ -52,19 +52,19 @@
                 <geom name="fin2_visual" type="mesh" mesh="fin2" rgba="1 1 1 1" contype="0" conaffinity="0" group="1" density="0" />
                 <site name="right_finger_tip_site" pos="0.04 -0.035 0.165" size="0.006" rgba="0 0 0.8 1" />
                 <site name="peg_tip_site" pos="0.04 -0.035 0.1" size="0.006" rgba="1 0.5 0 1" />
-                <geom name="fin2_finger_collision" type="box" pos="0.04 -0.035 0.165" size="0.012 0.018 0.035" rgba="0 1 0 0.25" friction="2.0 0.02 0.002" condim="4" />
+                <geom name="fin2_finger_collision" type="box" pos="0.04 -0.035 0.165" size="0.006 0.010 0.020" rgba="0 0.8 0 0.08" friction="2.0 0.02 0.002" condim="4" />
               </body>
             </body>
           </body>
         </body>
       </body>
     </body>
-    <body name="grasp_object" pos="0.1143017899 -0.9824570878 0.3209713723">
+    <body name="grasp_object" pos="0.0625 -0.5111 0.2570">
       <freejoint name="grasp_object_freejoint" />
-      <geom name="grasp_object_collision" type="cylinder" size="0.010 0.060" rgba="0.95 0.55 0.15 1" mass="0.035" friction="2.5 0.04 0.004" condim="4" />
-      <geom name="grasp_object_spin_mark" type="box" pos="0.0105 0 0" size="0.0012 0.0012 0.055" rgba="0.18 0.10 0.04 1" contype="0" conaffinity="0" />
+      <geom name="grasp_object_collision" type="cylinder" size="0.016 0.060" rgba="0.95 0.55 0.15 1" mass="0.035" friction="2.5 0.04 0.004" condim="4" />
+      <geom name="grasp_object_spin_mark" type="box" pos="0.0165 0 0" size="0.0014 0.0014 0.055" rgba="0.18 0.10 0.04 1" contype="0" conaffinity="0" />
     </body>
-    <body name="hole_fixture" pos="0.0983017899 -0.9704570878 0.1909713723">
+    <body name="hole_fixture" pos="0.5111 0.0565 0.2371">
       <site name="hole_entry_site" pos="0 0 0" size="0.008" rgba="0 0.7 1 1" />
       <site name="hole_axis_site" pos="0 0 -0.05" size="0.006" rgba="0.45 0 0.9 1" />
       <geom name="hole_top_plate_visual" type="box" pos="0 0 -0.018" size="0.070 0.070 0.006" rgba="0.2 0.3 0.9 0.35" contype="0" conaffinity="0" />

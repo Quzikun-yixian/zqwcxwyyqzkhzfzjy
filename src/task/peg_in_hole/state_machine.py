@@ -7,7 +7,7 @@ from enum import Enum, auto
 
 class PegInHoleState(Enum):
     IDLE = auto()
-    APPROACH_HOLE = auto()
+    INITIAL_GRASP = auto()
     GRASP_PEG = auto()
     MOVE_TO_PRE_INSERT = auto()
     REACHING_PUSH = auto()
@@ -41,8 +41,8 @@ class PegInHoleStateMachine:
             return self._fail(context, "ik_failed")
 
         if self.state == PegInHoleState.IDLE:
-            self.state = PegInHoleState.APPROACH_HOLE
-        elif self.state == PegInHoleState.APPROACH_HOLE:
+            self.state = PegInHoleState.INITIAL_GRASP
+        elif self.state == PegInHoleState.INITIAL_GRASP:
             if context.approach_done:
                 self.state = PegInHoleState.GRASP_PEG
         elif self.state == PegInHoleState.GRASP_PEG:
